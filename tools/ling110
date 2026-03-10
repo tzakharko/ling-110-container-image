@@ -550,15 +550,25 @@ def run_onboarding():
     import random
     console.print(f"  [bold cyan]Welcome to LING110, {random.choice(banter)}[/bold cyan]")
 
-    console.print("  Let's set things up for you\n")
+    console.print("  Let's set things up for you")
+    console.print("")
 
-    while not (name := Prompt.ask("  What is your name?")):
-        console.print("  [italic]It appears that you have entered an empty value. Let's try this again[/italic]")
+    netid = get_ucsb_netid()
 
-    while not check_ucsb_email(email := Prompt.ask("  What is your UCSB email ending in @ucsb.edu?")):
-        console.print("  [italic]The email address appears to be invalid. Let's try this again[/italic]")
+    if get_ucsb_netid != "":
+        while not (name := Prompt.ask("  What is your name?")):
+            console.print("  [italic]It appears that you have entered an empty value. Let's try this again[/italic]")
 
-    console.print(f"\n  Thank you, [white]{name}[/white], now let's link your GitHub account")
+        while not check_ucsb_email(email := Prompt.ask("  What is your UCSB email ending in @ucsb.edu?")):
+            console.print("  [italic]The email address appears to be invalid. Let's try this again[/italic]")
+
+        console.print(f"\n  Thank you, [bold]{name}[/bold], now let's link your GitHub account")
+    else:
+        name = netid
+        email = netid + "@ucsb.edu"
+
+        console.print(f"\n  Your email was auto-detected as [bold]{email}[/bold]")
+        console.print(f"\n  Now, let's link your GitHub account")
 
     gh_auth_login()
 
