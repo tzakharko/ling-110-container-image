@@ -45,87 +45,10 @@ RUN pip install gensim \
     rich \
     click
 
-#-- Install the ling110 tool
-COPY tools/ling110 /usr/local/bin
-RUN chmod +x /usr/local/bin/ling110
-
-RUN rm -rf /home/jovyan/work
-
-#-- Scaffold the locations and starting content
-USER $NB_USER
-
-# introductory notebook file
-RUN wget -q https://sjtodd.github.io/ling110/intro-notebook.ipynb -O $HOME/intro-notebook.ipynb
-
-# assignment folders
-RUN mkdir -p $HOME/assignments
-RUN mkdir -p $HOME/.util
-
-# Create .gitignore
-RUN cat > $HOME/.gitignore <<EOF
-**/__pycache__/*
-**/.ipynb_checkpoints/*
-**/.pytest_cache/*
-**/core.*
-EOF
-
-RUN git config --global core.excludesFile $HOME/.gitignore
-
-# Update Jupyterlab advanced settings files
-RUN mkdir -p $HOME/.jupyter/lab/user-settings/@jupyterlab
-
-RUN mkdir -p $HOME/.jupyter/lab/user-settings/@jupyterlab/docmanager-extension
-RUN cat > $HOME/.jupyter/lab/user-settings/@jupyterlab/docmanager-extension/plugin.jupyterlab-settings <<EOF
-{
-    defaultViewers: {
-        markdown: "Markdown Preview",
-        json: "Editor"
-    }
-}
-EOF
-
-RUN mkdir -p $HOME/.jupyter/lab/user-settings/@jupyterlab/fileeditor-extension
-RUN cat > $HOME/.jupyter/lab/user-settings/@jupyterlab/fileeditor-extension/plugin.jupyterlab-settings <<EOF
-{
-    "editorConfig": {
-        "fontSize": 14,
-        "lineNumbers": true,
-        "codeFolding": true
-    }
-}
-EOF
-
-RUN mkdir -p $HOME/.jupyter/lab/user-settings/@jupyterlab/notebook-extension
-RUN cat > $HOME/.jupyter/lab/user-settings/@jupyterlab/notebook-extension/tracker.jupyterlab-settings <<EOF
-{
-    "kernelShutdown": true,
-    "codeCellConfig": {
-        "lineNumbers": true
-    },
-    "showEditorForReadOnlyMarkdown": false
-}
-EOF
-
-RUN mkdir -p $HOME/.jupyter/lab/user-settings/@jupyterlab/terminal-extension
-RUN cat > $HOME/.jupyter/lab/user-settings/@jupyterlab/terminal-extension/plugin.jupyterlab-settings <<EOF
-{
-    "fontSize": 14,
-    "shutdownOnClose": true
-}
-EOF
-
-RUN mkdir -p $HOME/.jupyter/lab/user-settings/@jupyterlab/apputils-extension
-RUN cat > $HOME/.jupyter/lab/user-settings/@jupyterlab/apputils-extension/notification.jupyterlab-settings <<EOF
-{
-    "fetchNews": "false",
-    "doNotDisturbMode": true
-}
-EOF
-
-RUN gh auth setup-git --hostname github.com --force
-
-RUN echo 'echo "Welcome to the course environment, please run \e[1mling110\e[0m in terminal to check your assignment status"' >> $HOME/.bashrc
-
+#-- copy the course setup files
+COPY dist/ /opt/ling110/
+RUN chmod +x /opt/ling110/bin/*
+RUN ln -s /opt/ling110/bin/ling110 /usr/local/bin/ling110
 
 # Set environment variables for SRILM
 ENV LC_NUMERIC=C \
