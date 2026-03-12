@@ -31,10 +31,13 @@ from functools import cache
 console = Console()
 
 # ── Configuration ────────────────────────────────────────────────────────────────────────────────────────────────────
-GITHUB_CLIENT_ID = "Ov23livNUWZBFVyed4JY"
 GITHUB_ORG = "ucsb-ling110"
-
 BASE_DIR = Path.home() / "assignments"
+
+GITHUB_CLIENT_ID = os.environ.get("GITHUB_CLIENT_ID")
+if not GITHUB_CLIENT_ID:
+    raise RuntimeError("GITHUB_CLIENT_ID environment variable is not set")
+
 
 ASSIGNMENT_LIST = [
     "placement",
