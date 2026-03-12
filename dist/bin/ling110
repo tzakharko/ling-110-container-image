@@ -1,0 +1,651 @@
+#!/usr/bin/env python3
+"""
+ling110 - Assignment management tool for LING 110
+"""
+
+import subprocess
+import json
+from pathlib import Path
+import shutil
+
+import click
+from rich.console import Console
+from rich.table import Table
+from rich import box
+from rich.text import Text
+from rich.prompt import Prompt, Confirm
+
+import random
+import requests
+import time
+from datetime import datetime
+import sys
+import os
+
+from types import SimpleNamespace
+
+
+# memoization
+from functools import cache
+
+console = Console()
+
+# ── Configuration ────────────────────────────────────────────────────────────────────────────────────────────────────
+GITHUB_ORG = "ucsb-ling110"
+BASE_DIR = Path.home() / "assignments"
+
+GITHUB_CLIENT_ID = os.environ.get("GITHUB_CLIENT_ID")
+if not GITHUB_CLIENT_ID:
+    raise RuntimeError("GITHUB_CLIENT_ID environment variable is not set")
+
+
+ASSIGNMENT_LIST = [
+    "placement",
+    "assignment1",
+    "assignment2",
+    "assignment3",
+    "assignment4"
+]
+
+# ── GitHub Utilities  ────────────────────────────────────────────────────────────────────────────────────────────────
+def gh_api_get(*cmd) -> str | None:
+    try:
+        result = subprocess.run(["gh", "api", *cmd], capture_output=True, text=True, check=True)
+        return result.stdout.strip()
+    except:
+        return None
+
+@cache
+def gh_get_user() -> str:
+    """Read the authenticated GitHub username from gh CLI."""
+    username = gh_api_get("user", "--jq", ".login")
+    if username is None:
+        raise RuntimeError("No authenticated GitHub user")
+
+    return username
+
+def get_ucsb_netid() -> str:
+    return os.environ.get("JUPYTERHUB_USER", "")
+
+def gh_auth_login() -> None:
+    # request the device code
+    r = requests.post("https://github.com/login/device/code",
+        headers={"Accept": "application/json"},
+        data={"client_id": GITHUB_CLIENT_ID, "scope": "repo read:org"}
+    )
+    data = r.json()
+
+    device_code = data["device_code"]
+    user_code   = data["user_code"]
+    verify_url  = data["verification_uri"]
+    interval    = data["interval"]
+
+    # prompt the student to authorize the device
+    console.print(f"  Open [cyan]{verify_url}[/cyan] in your browser and log in to your GitHub account")
+    console.print(f"  Enter code [bold]{user_code}[/bold] when asked\n")
+
+    # poll until authorized
+    try:
+        while True:
+            time.sleep(interval)
+            r = requests.post("https://github.com/login/oauth/access_token",
+                headers={"Accept": "application/json"},
+                data={
+                    "client_id": GITHUB_CLIENT_ID,
+                    "device_code": device_code,
+                    "grant_type": "urn:ietf:params:oauth:grant-type:device_code"
+                }
+            )
+            result = r.json()
+
+            if "access_token" in result:
+                # Store token for gh CLI to use
+                subprocess.run(["gh", "auth", "login", "--with-token"], input=result["access_token"], text=True)
+                subprocess.run(["gh", "auth", "setup-git"], text=True)
+
+                username = gh_get_user()
+
+                console.print(f"  [green]✓[/green] Successfully linked GitHub Account [white]{username}[/white]")
+                return
+            elif result.get("error") == "authorization_pending":
+                continue  # still waiting
+            elif result.get("error") == "slow_down":
+                interval += 5
+            else:
+                raise RuntimeError(f"Authentication failed: {result.get('error')}")
+    except:
+        console.print(f"  [red]Failed to link the GitHub account[/red]\n")
+        console.print(f"  Please try again\n")
+        console.print(f"  Contact the instructor if the problem persists\n")
+        sys.exit(1)
+
+# ── Git Utilities ────────────────────────────────────────────────────────────────────────────────────────────────────
+def git_run(local_uri: Path, *cmd) -> str | None:
+    try:
+        result = subprocess.run(["git", *cmd], cwd = local_uri, capture_output=True, text=True, check=True)
+        return result.stdout.strip()
+    except:
+        return None
+
+@cache
+def git_credentials() -> (str , str):
+    return (
+        git_run(None, "config", "--global", "--get", "user.name"),
+        git_run(None, "config", "--global", "--get", "user.email")
+    )
+
+@cache
+def find_initial_commit(local_uri):
+    """
+        Return the hash of the assignment initial commit, which is the commit before any student activity.
+        This is the last commit done by the github-classroom bot.
+
+        Note: This is fragile and should be improved in future workflow iteration.
+    """
+    git_run(local_uri, "fetch", "origin")
+    out = git_run(local_uri, "log", "origin/main", "--format=%H\t%an")
+
+    for line in out.splitlines():
+        commit_hash, author_name = line.split("\t", 1)
+
+        if author_name.startswith("github-classroom"):
+            return commit_hash
+
+    return None
+
+# ── Assignment Management ────────────────────────────────────────────────────────────────────────────────────────────
+def checked_assignment(assignment) -> str:
+    assignment = assignment.lower()
+    if assignment not in ASSIGNMENT_LIST:
+        console.print(f"  [bold red]Error:[/bold red] unknown assignment [cyan]{assignment}[/cyan]")
+        known = ", ".join([f"[cyan]{assignment}[/cyan]" for assignment in ASSIGNMENT_LIST])
+        console.print(f"  Known assignments: {known}")
+        sys.exit(1)
+
+    return assignment
+
+@cache
+def find_last_submission(local_uri) -> (datetime | None, bool):
+    # date of the last commit after the initial commit
+    commit_range = f"{find_initial_commit(local_uri)}...origin/main"
+    last_commit_date = git_run(local_uri, "log", commit_range, "-1", "--date=iso-strict", "--format=%cd")
+
+    if last_commit_date is None or len(last_commit_date) == 0:
+        return (None, False)
+
+    # additional checks
+    last_commit_date = datetime.fromisoformat(last_commit_date)
+
+    # check if .FINAL is present
+    is_final = git_run(local_uri, "cat-file", "-e", "origin/main:.FINAL") is not None
+
+    return (last_commit_date, is_final)
+
+@cache
+def get_assignment_info(assignment):
+    assignment = checked_assignment(assignment)
+    username = gh_get_user()
+
+    # GitHub repository and local path for the assignment
+    repo_name = f"{assignment}-{username}"
+    remote_uri = f"https://github.com/{GITHUB_ORG}/{repo_name}.git"
+    local_uri = BASE_DIR / assignment
+
+    # check if the repository exists on the remote
+    remote_exists = gh_api_get(f"repos/{GITHUB_ORG}/{repo_name}") is not None
+
+    # check if the repository has been created locally and is configured correctly
+    local_exists = local_uri.exists()
+    local_repo_valid = git_run(local_uri, "remote", "get-url", "origin") == remote_uri
+
+    # check if there are any changes present (we need to run git status first to update the cache it seems)
+    git_run(local_uri, "status")
+    local_changes_present = git_run(local_uri, "diff-index", "HEAD", "--") != "" if local_repo_valid else False
+
+    # locate the initial commit
+    initial_commit = find_initial_commit(local_uri) if local_repo_valid else None
+
+    # date of the last submission
+    (last_commit_date, is_final) = find_last_submission(local_uri) if local_repo_valid else (None, False)
+
+    # return the information as a dictionary
+    return SimpleNamespace(
+        assignment = assignment,
+        repo_name = repo_name,
+        remote_uri = remote_uri,
+        local_uri = local_uri,
+        remote_exists = remote_exists,
+        local_repo_valid = local_repo_valid,
+        local_changes_present = local_changes_present,
+        has_error = local_exists and not local_repo_valid,
+        initial_commit = initial_commit,
+        last_commit_date = last_commit_date,
+        is_final = is_final
+    )
+
+def check_notebook_executed(path):
+    nb = json.loads(Path(path).read_text())
+    code_cells = [c for c in nb['cells'] if c['cell_type'] == 'code']
+
+    counts = [c['execution_count'] for c in code_cells]
+
+    # Check none are unexecuted
+    if any(c is None for c in counts):
+        return False, "some notebook cells have not been executed"
+
+    # Check sequential order (no skipped/out-of-order cells)
+    if counts != list(range(1, len(counts) + 1)):
+        return False, "notebook cells were not run top-to-bottom in order"
+
+    return True, "OK"
+
+def fetch_assignment(assignment):
+    assignment = checked_assignment(assignment)
+    info = get_assignment_info(assignment)
+
+    if not info.remote_exists:
+        console.print(f"  [cyan]{assignment}[/cyan] has not been assigned yet, nothing to do")
+    if info.local_repo_valid:
+        git_run(info.local_uri, "fetch", "origin")
+        console.print(f"  [cyan]{assignment}[/cyan] already fetched, nothing to do")
+    elif info.has_error:
+        console.print(f"  [bold red]Error[/bold red]: [cyan]{info.local_uri}[/cyan] exists but is not configured properly")
+        console.print(f"\n  You can run '[bold]ling110 fetch --force {assignment}[/bold]' to fetch the assignment again")
+        console.print(f"    ([yellow]warning[/yellow]: this command will delete any work currently in progress!)")
+        console.print(f"\n  Alternatively, contact the instructor for assistance")
+        sys.exit(1)
+    else:
+        status = git_run(None, "clone", info.remote_uri, info.local_uri)
+        if status is None:
+            console.print(f"  [red]Error fetching[/red] [cyan]{assignment}[/cyan]!")
+            console.print(f"  Please contact the instructor")
+            sys.exit(1)
+
+        console.print(f"  [green]✓[/green] Successfully fetched [cyan]{assignment}[/cyan]")
+
+def submit_assignment(assignment: str) -> None:
+    assignment = checked_assignment(assignment)
+    info = get_assignment_info(assignment)
+
+    if not info.remote_exists:
+        console.print(f"  [cyan]{assignment}[/cyan] has not been assigned yet, nothing to do")
+        return
+    elif info.is_final:
+        console.print(f"  [cyan]{assignment}[/cyan] has already been submitted for grading, you are good!")
+        return
+    elif info.has_error:
+        console.print(f"  [bold red]Error[/bold red]: [cyan]{info.local_uri}[/cyan] exists but is not configured properly")
+        console.print(f"\n  You can run '[bold]ling110 fetch --force {assignment}[/bold]' to fetch the assignment again")
+        console.print(f"    ([yellow]warning[/yellow]: this command will delete any work currently in progress!)")
+        console.print(f"\n  Alternatively, contact the instructor for assistance")
+        sys.exit(1)
+
+
+    is_final = Confirm.ask(f"  Is this a [bold]final[/bold] submission for [cyan]{assignment}[/cyan]?")
+    if is_final:
+        is_final = Confirm.ask(f"  You won't be able to submit again after the final submission, are you sure?")
+
+    # validate the notebook for the final submission
+    if is_final and assignment.startswith("assignment"):
+        notebook_uri = info.local_uri / f"{assignment}.ipynb"
+        if not notebook_uri.exists():
+            console.print(f"  [bold red]Error[/bold red]: cannot find the notebook for [cyan]{assignment}[/cyan]")
+            console.print(f"\n  Did you delete the notebook file by mistake?")
+            console.print(f"\n  You can run '[bold]ling110 fetch --force {assignment}[/bold]' to fetch the assignment again")
+            console.print(f"    ([yellow]warning[/yellow]: this command will delete any work currently in progress!)")
+            console.print(f"\n  Alternatively, contact the instructor for assistance")
+            return
+
+        is_ok, msg = check_notebook_executed(notebook_uri)
+        if not is_ok:
+            console.print(f"  [bold red]Error[/bold red] submitting [cyan]{assignment}[/cyan] — {msg}")
+            console.print(f"\n  Did you run '[bold]Restart Kernel and Run All Cells...[/bold]'?")
+            console.print(f"  Contact the instructor for assistance if you keep getting this message")
+            exit(1)
+
+    # mark as final
+    if is_final:
+        (info.local_uri / ".FINAL").touch()
+        git_run(info.local_uri, "add", ".FINAL")
+    elif not info.local_changes_present:
+        console.print(f"  [cyan]{assignment}[/cyan] has no local changes, nothing to submit")
+        console.print(f"  Did you save the changes to the notebook?")
+        return
+
+
+    # stage all tracked changes and commit
+    commit_message = "Final submission" if is_final else "Submit assignment"
+    status = git_run(info.local_uri, "add", "-u")
+    status = git_run(info.local_uri, "commit", "-m", commit_message) if status is not None else None
+    status = git_run(info.local_uri, "push") if status is not None else None
+
+    if status is None:
+        console.print(f"  [red]Error submitting[/red] [cyan]{assignment}[/cyan]!")
+        console.print(f"  Please contact the instructor")
+        sys.exit(1)
+
+    # all good!
+    console.print(f"\n  [green]✓[/green] Successfully submitted [cyan]{assignment}[/cyan]\n")
+    if is_final:
+        final_banter = [
+            "great work, you crushed it!",
+            "excellent effort, well done!",
+            "you nailed it, good job!",
+            "fantastic work, be proud!",
+            "way to go, all done!",
+            "brilliant effort, you did it!",
+            "outstanding work, keep it up!",
+            "you're a star, well done!",
+            "knocked it out of the park!",
+        ]
+
+        console.print(f"  This was the [bold green]FINAL[/bold green] submission for [cyan]{assignment}[/cyan], {random.choice(final_banter)}")
+    else:
+        console.print(f"  This is [bold]not[/bold] a final submission, you can submit again")
+        console.print(f"  Don't forget to submit as FINAL to have the assignment graded")
+        console.print(f"  Keep in mind the late submission policy")
+
+def reset_assignment(assignment: str) -> None:
+    assignment = checked_assignment(assignment)
+    info = get_assignment_info(assignment)
+
+    if not info.remote_exists:
+        console.print(f"  [cyan]{assignment}[/cyan] has not been assigned yet, nothing to do")
+        return
+    elif info.is_final:
+        console.print(f"  [cyan]{assignment}[/cyan] has already been submitted for grading, cannot reset")
+        return
+    elif info.has_error:
+        console.print(f"  [bold red]Error[/bold red]: [cyan]{info.local_uri}[/cyan] exists but is not configured properly")
+        console.print(f"\n  You can run '[bold]ling110 fetch --force {assignment}[/bold]' to fetch the assignment again")
+        console.print(f"    ([yellow]warning[/yellow]: this command will delete any work currently in progress!)")
+        console.print(f"\n  Alternatively, contact the instructor for assistance")
+        sys.exit(1)
+
+
+    console.print(f"  Reset of [cyan]{assignment}[/cyan] progress has been requested")
+    if not Confirm.ask(f"  Resetting will discard all your work, are you absolutely certain?"):
+        console.print(f"  Aborting")
+
+
+    backup_ref = "refs/reset-backups/before-reset"
+    status = ""
+
+    # save the current state (if any)
+    if info.local_changes_present:
+        status = git_run(info.local_uri, "add", "-u")
+        status = git_run(info.local_uri, "commit", "-m", "Submit assignment") if status is not None else None
+        status = git_run(info.local_uri, "push") if status is not None else None
+
+    # backup the state
+    if status is not None:
+        status = git_run(info.local_uri, "update-ref", backup_ref, "HEAD")
+
+    # reset the state
+    if status is not None:
+        status = git_run(info.local_uri, "restore", "--source", info.initial_commit, "--staged", "--worktree", ".")
+        status = git_run(info.local_uri, "clean", "-dfx") if status is not None else None
+        status = git_run(info.local_uri, "add", "-A") if status is not None else None
+        status = git_run(info.local_uri, "commit", "-m", "Reset progress") if status is not None else None
+
+
+    if status is None:
+        console.print(f"  [red]Error resetting[/red] [cyan]{assignment}[/cyan]!")
+        console.print(f"  Please contact the instructor")
+        sys.exit(1)
+
+    # all good!
+    console.print()
+    console.print(f"  [green]✓[/green] Successfully reset [cyan]{assignment}[/cyan]")
+    console.print()
+    console.print(f"    If you change your mind, you can still return to your previous work")
+    console.print(f"    by running the following commands in the terminal")
+    console.print()
+    console.print(f"      [bold]git -C {info.local_uri} restore --source {backup_ref} --worktree .[/bold]")
+    console.print(f"      [bold]git -C {info.local_uri}  clean -fd[/bold]")
+    console.print(f"      [bold]git -C {info.local_uri}  reset[/bold]")
+
+    console.print()
+    print_encouraging_banter()
+
+def default_action() -> None:
+    """Pretty-print status of all assignments, fetch assignments if needed """
+
+    git_user, git_email = git_credentials()
+
+    table = Table(
+        box=box.SIMPLE,
+        show_header=True,
+        header_style="bold cyan",
+        border_style="bright_black",
+        padding=(0, 1),
+    )
+
+    table.add_column("Assignment", min_width=12)
+    table.add_column("Status",  justify="left", min_width=20)
+    table.add_column("Submitted",  justify="left", min_width=16)
+
+    assignments_with_errors = []
+    pending_assignments = []
+    to_fetch = []
+
+    for assignment in ASSIGNMENT_LIST:
+        info = get_assignment_info(assignment)
+
+        # status determination
+        if not info.remote_exists:
+            status = ""
+        elif info.has_error:
+            status = Text("configuration error", style="red")
+            assignments_with_errors.append(info)
+        elif info.is_final:
+            status = Text("submitted", style="bold green")
+        elif info.local_repo_valid:
+            status = Text("in progress", style="blue")
+        else:
+            status = Text("assigned", style="blue")
+            to_fetch.append(info)
+
+
+        if info.local_repo_valid and not info.is_final:
+            pending_assignments.append(info)
+
+        # submission
+        if info.last_commit_date is not None:
+            submission = info.last_commit_date.strftime("%b %d, %Y %I:%M %p")
+            if info.is_final:
+                submission = Text(f"{submission} (final)", style="bold green")
+        else:
+            submission = ""
+
+        # row header
+        if not info.remote_exists:
+            label = Text(assignment, style = "grey50")
+        else:
+            label = Text(assignment, style="bold white")
+
+        table.add_row(
+            label,
+            status,
+            submission,
+        )
+
+    console.print()
+    console.print(f"  [bold cyan]github.com/{GITHUB_ORG}[/bold cyan] [white]{git_user} <{git_email}>[/white]")
+    console.print()
+    console.print(table)
+
+    if len(assignments_with_errors):
+        console.print()
+        console.print(f"  [bold red]Configuration errors detected:[/bold red]")
+
+        for info in assignments_with_errors:
+            if (info.local_uri / ".git").exists():
+                msg = f"git repository [cyan]{info.local_uri}[/cyan] is not configured properly"
+            else:
+                msg = f"[cyan]{info.local_uri}[/cyan] is not a git repository"
+
+            console.print(f"    • {msg}")
+
+        console.print("")
+        first = assignments_with_errors[0].assignment
+        console.print(f"    You can run '[bold]ling110 fetch --force {first}[/bold]' to fetch the assignment again")
+        console.print(f"      ([yellow]warning[/yellow]: this command will delete any work currently in progress!)")
+        console.print(f"\n    Alternatively, contact the instructor for assistance")
+
+        sys.exit(1)
+
+    # show assignments pending final submission
+    for info in pending_assignments:
+        console.print()
+        msg = "([yellow]local changes present[/yellow])" if info.local_changes_present else ""
+        console.print(f"  • [cyan]{info.assignment}[/cyan] has not been submitted yet for grading {msg}")
+        console.print(f"      to submit, run '[bold]ling110 submit {info.assignment}[/bold]'")
+
+    # fetch all assigned not but yet fetched assignments
+    if len(to_fetch) > 0:
+        console.print()
+        console.print("  Some assignments have not been fetched yet, fetching...")
+        for info in to_fetch:
+            fetch_assignment(info.assignment)
+
+        console.print()
+        print_encouraging_banter()
+
+    console.print()
+
+
+
+def print_encouraging_banter():
+    banter = [
+        "Happy hacking!",
+        "Time to write some code!",
+        "Let's get to work!",
+        "Good luck, have fun!",
+        "May your code be bug-free!",
+        "Let the hacking begin!",
+        "You've got this!",
+        "Go get 'em!",
+        "Make it count!",
+        "Enjoy the journey!",
+    ]
+    console.print(f"  {random.choice(banter)}")
+
+
+# ── Onboarding ───────────────────────────────────────────────────────────────────────────────────────────────────────
+def check_ucsb_email(input) -> bool:
+    """Check if the input is a valid UCSB email address"""
+    return input.endswith("@ucsb.edu")
+
+def run_onboarding():
+    banter = [
+        "we are excited to have you!",
+        "glad you could join us!",
+        "this is going to be a great quarter!",
+        "let's do some linguistics!",
+        "welcome aboard!",
+        "we're happy you're here!",
+        "let's make this a great experience!",
+        "you're in for a treat!",
+        "the adventure begins now!",
+        "we can't wait to get started with you!",
+    ]
+    import random
+    console.print(f"  [bold cyan]Welcome to LING110, {random.choice(banter)}[/bold cyan]")
+
+    console.print("  Let's set things up for you")
+    console.print("")
+
+    netid = get_ucsb_netid()
+
+    if get_ucsb_netid != "":
+        while not (name := Prompt.ask("  What is your name?")):
+            console.print("  [italic]It appears that you have entered an empty value. Let's try this again[/italic]")
+
+        while not check_ucsb_email(email := Prompt.ask("  What is your UCSB email ending in @ucsb.edu?")):
+            console.print("  [italic]The email address appears to be invalid. Let's try this again[/italic]")
+
+        console.print(f"\n  Thank you, [bold]{name}[/bold], now let's link your GitHub account")
+    else:
+        name = netid
+        email = netid + "@ucsb.edu"
+
+        console.print(f"\n  Your email was auto-detected as [bold]{email}[/bold]")
+        console.print(f"\n  Now, let's link your GitHub account")
+
+    gh_auth_login()
+
+    git_run("/", "config", "--global", "user.name", name)
+    git_run("/", "config", "--global", "user.email", email)
+
+    console.print(f"\n  [green bold]Congratulations, {name}, you are all set![/green bold]")
+    console.print("  Please re-run [bold]ling110[/bold] to check your assignment status")
+    console.print()
+    print_encouraging_banter()
+
+def check_onboarded():
+    try:
+        git_user = gh_get_user()
+    except:
+        git_user = None
+    git_name, git_email = git_credentials()
+
+    return git_user and git_name and git_email
+
+
+# ── CLI ──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+@click.group(invoke_without_command=True)
+@click.pass_context
+def cli(ctx):
+    """ling110 assignment management tool"""
+    if ctx.invoked_subcommand is not None:
+         return
+
+    default_action()
+
+
+@cli.command()
+@click.argument('assignment')
+@click.option('--force', is_flag=True, default=False, help="Overwrite the assignment directory")
+def fetch(assignment, force):
+    """ Fetch assignment from GitHub """
+    assignment = checked_assignment(assignment)
+
+    info = get_assignment_info(assignment)
+    if force and info.local_uri.exists():
+        try:
+            shutil.rmtree(info.local_uri)
+            if info.local_uri.exists():
+                raise Exception("Failed to remove assignment directory")
+        except:
+            console.print(f"  [bold red]Error removing[/bold red] [cyan]{info.local_uri}[/cyan]")
+            console.print(f"  Please contact the instructor")
+            sys.exit(1)
+
+        # invalidate the cache so that get_assignment_info() works correctly
+        get_assignment_info.cache_clear()
+
+    # actually fetch the assignment
+    fetch_assignment(assignment)
+    print_encouraging_banter()
+
+@cli.command()
+@click.argument('assignment')
+def submit(assignment):
+    """ Submit the assignment to GitHub """
+    submit_assignment(assignment)
+
+@cli.command()
+@click.argument('assignment')
+def reset(assignment):
+    """ Reset the assignment progress """
+    reset_assignment(assignment)
+
+
+if __name__ == "__main__":
+    # check that the user is onboarded
+    if not check_onboarded():
+        run_onboarding()
+        sys.exit(0)
+
+    cli()
