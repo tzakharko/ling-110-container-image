@@ -30,7 +30,20 @@ pipeline {
                 }
                 stage('Test') {
                     steps {
-                        sh 'podman run -it --rm --pull=never localhost/$IMAGE_NAME python -c "import numpy;import gensim;import sklearn; sklearn.show_versions();import pytest;from prettytable import PrettyTable;import requests;import matplotlib;import nltk;import pandas;import arpa;import morfessor;"'
+                        sh 'podman run -it --rm --pull=never localhost/$IMAGE_NAME which ling110'
+                        sh 'podman run -it --rm --pull=never localhost/$IMAGE_NAME python -c "import arpa"'
+                        sh 'podman run -it --rm --pull=never localhost/$IMAGE_NAME python -c "import click"'
+                        sh 'podman run -it --rm --pull=never localhost/$IMAGE_NAME python -c "import gensim"'
+                        sh 'podman run -it --rm --pull=never localhost/$IMAGE_NAME python -c "import matplotlib"'
+                        sh 'podman run -it --rm --pull=never localhost/$IMAGE_NAME python -c "import morfessor"'
+                        sh 'podman run -it --rm --pull=never localhost/$IMAGE_NAME python -c "import nltk"'
+                        sh 'podman run -it --rm --pull=never localhost/$IMAGE_NAME python -c "import numpy"'
+                        sh 'podman run -it --rm --pull=never localhost/$IMAGE_NAME python -c "import pandas"'
+                        sh 'podman run -it --rm --pull=never localhost/$IMAGE_NAME python -c "from prettytable import PrettyTable"'
+                        sh 'podman run -it --rm --pull=never localhost/$IMAGE_NAME python -c "import pytest"'
+                        sh 'podman run -it --rm --pull=never localhost/$IMAGE_NAME python -c "import requests"'
+                        sh 'podman run -it --rm --pull=never localhost/$IMAGE_NAME python -c "import rich"'
+                        sh 'podman run -it --rm --pull=never localhost/$IMAGE_NAME python -c "import sklearn; sklearn.show_versions()"'
                         sh 'podman run -d --name=$IMAGE_NAME --rm --pull=never -p 8888:8888 localhost/$IMAGE_NAME start-notebook.sh --NotebookApp.token="jenkinstest"'
                         sh 'sleep 10 && curl -v http://localhost:8888/lab?token=jenkinstest 2>&1 | grep -P "HTTP\\S+\\s200\\s+[\\w\\s]+\\s*$"'
                         sh 'curl -v http://localhost:8888/tree?token=jenkinstest 2>&1 | grep -P "HTTP\\S+\\s200\\s+[\\w\\s]+\\s*$"'
