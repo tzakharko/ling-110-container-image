@@ -22,6 +22,8 @@ from datetime import datetime
 import sys
 import os
 
+import logging
+
 from types import SimpleNamespace
 
 
@@ -29,6 +31,8 @@ from types import SimpleNamespace
 from functools import cache
 
 console = Console()
+
+logger = logging.getLogger("ling110")
 
 # ── Configuration ────────────────────────────────────────────────────────────────────────────────────────────────────
 GITHUB_ORG = "ucsb-ling110"
@@ -53,6 +57,7 @@ def gh_api_get(*cmd) -> str | None:
         result = subprocess.run(["gh", "api", *cmd], capture_output=True, text=True, check=True)
         return result.stdout.strip()
     except Exception:
+        logger.exception("gh invocation error")
         return None
 
 @cache
@@ -125,6 +130,7 @@ def git_run(local_uri: Path, *cmd) -> str | None:
         result = subprocess.run(["git", *cmd], cwd = local_uri, capture_output=True, text=True, check=True)
         return result.stdout.strip()
     except Exception:
+        logger.exception("git invocation error")
         return None
 
 @cache
