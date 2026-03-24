@@ -33,6 +33,8 @@ from functools import cache
 console = Console()
 
 logger = logging.getLogger("ling110")
+logger.setLevel(logging.CRITICAL)
+
 
 # ── Configuration ────────────────────────────────────────────────────────────────────────────────────────────────────
 GITHUB_ORG = "ucsb-ling110"
